@@ -4,6 +4,15 @@
 
 ---
 
+**Nombre:** Kevin Sebastian Flores Lopez  
+**Carnet:** 17068  
+**Carrera:** Ingeniería Electrónica y Telecomunicaciones  
+**Curso:** Microcontroladores  
+**Catedrático:** Ing. Víctor Vargas  
+**Evaluación:** Parcial 3  
+
+---
+
 ## Videos en YouTube
 
 - **Video mostrando el código de la caja fuerte:**  
