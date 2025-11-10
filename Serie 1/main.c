@@ -91,8 +91,14 @@ static inline void BUZZER_OFF(void){ GPIOA->BSRR = (1u<<(7+16)); }
 /*** ------------------ ESTADO GLOBAL DE LA CAJA FUERTE ------------------ ***/
 #define LOCK_CODE_LEN 4
 
-// Código correcto fijo: "1234"
-static const char lock_correct_code[LOCK_CODE_LEN] = { '1','2','3','4' };
+// Código correcto inicial: "1234" (ahora modificable en RAM)
+static char lock_correct_code[LOCK_CODE_LEN] = { '1','2','3','4' };
+
+
+// Clave maestra para quitar el bloqueo: "ABCD"
+#define OVERRIDE_CODE_LEN 4
+static const char override_code[OVERRIDE_CODE_LEN] = { 'A','B','C','D' };
+
 
 typedef enum {
     LOCK_STATE_CLOSED = 0,
@@ -101,8 +107,39 @@ typedef enum {
     LOCK_STATE_CLOSING,
     LOCK_STATE_BLOCKED
 } lock_state_t;
-
 static volatile lock_state_t lock_state = LOCK_STATE_CLOSED;
+
+
+
+// Modo de ingreso de PIN (normal o cambio de PIN)
+typedef enum {
+    PIN_MODE_NORMAL = 0,      // ingresar PIN para abrir
+    PIN_MODE_CHANGE_OLD,      // pidiendo PIN actual
+    PIN_MODE_CHANGE_NEW       // pidiendo PIN nuevo
+} pin_mode_t;
+static volatile pin_mode_t pin_mode = PIN_MODE_NORMAL;
+
+
+
+// Modo de ajuste de hora (reloj HH:MM)
+typedef enum {
+    CLOCK_SET_NONE = 0,   // sin ajuste
+    CLOCK_SET_HOURS,      // ingresando horas (HH)
+    CLOCK_SET_MINUTES     // ingresando minutos (MM)
+} clock_set_mode_t;
+
+static volatile clock_set_mode_t clock_set_mode = CLOCK_SET_NONE;
+static volatile uint8_t clock_set_digits = 0;  // cuántos dígitos llevamos (0..2)
+static volatile uint8_t clock_set_val    = 0;  // valor parcial (0..59)
+
+// Buffer de los 4 dígitos que se van introduciendo en modo ajuste (HHMM)
+static volatile uint8_t clock_set_buf[4] = {0,0,0,0};
+static volatile uint8_t clock_set_pos    = 0;   // posición siguiente 0..4
+
+
+
+
+
 
 static volatile uint8_t  lock_attempts = 0;
 static volatile char     lock_entered_code[LOCK_CODE_LEN];
@@ -135,6 +172,9 @@ static const uint8_t seg_lut[10] =
     0b01101111  // 9
 };
 
+// Un "underscore" usando solo el segmento inferior (bit 3 = segmento d)
+#define SEG_UNDERSCORE 0x08u
+
 static volatile uint8_t seg_digits[4] = {0,0,0,0};
 
 static const uint8_t seg_digit_pins[4] = {5, 6, 8, 9};
@@ -162,6 +202,23 @@ static inline void seg_write_pattern(uint8_t pattern)
     GPIOB->BSRR = (0xFFu << 16);      // limpiar PB0..PB7
     GPIOB->BSRR = (uint32_t)pattern;  // cargar nuevo patrón
 }
+
+
+
+#ifndef SEG_HAS_DP
+#define SEG_HAS_DP 1
+#endif
+#define SEG_DP_MASK 0x80u  // bit del DP sobre PB7 según tu bus de segmentos
+
+// ——— Reloj en formato 24h ———
+static volatile uint8_t clock_hours   = 0;  // 0..23
+static volatile uint8_t clock_minutes = 0;  // 0..59
+static volatile uint8_t clock_seconds = 0;  // 0..59
+static volatile uint8_t colon_blink   = 0;  // 0/1: parpadear ":" cada segundo
+
+
+//hola
+
 
 /*** ------------------ LCD NO BLOQUEANTE ------------------ */
 #define LCD_RS_PORT GPIOA
@@ -554,6 +611,43 @@ static void keypad_scan_5ms(void)
 }
 
 /*** ------------------ LÓGICA DE TECLA (PIN, CERRAR, BLOQUEO) ------------------ */
+
+// Devuelve 1 cuando se ha recibido la secuencia completa "ABCD"
+static uint8_t check_override_sequence(char keychar)
+{
+    static uint8_t idx = 0; // cuántos caracteres correctos llevamos
+
+    if (keychar == override_code[idx])
+    {
+        // el carácter coincide con el esperado en la posición actual
+        idx++;
+        if (idx >= OVERRIDE_CODE_LEN)
+        {
+            // se completó "ABCD"
+            idx = 0;
+            return 1;
+        }
+    }
+    else
+    {
+        // no coincide con lo esperado, ver si este char puede ser inicio de la secuencia
+        if (keychar == override_code[0])
+        {
+            // empezamos de nuevo desde 'A'
+            idx = 1;
+        }
+        else
+        {
+            // cualquier otra cosa rompe la secuencia
+            idx = 0;
+        }
+    }
+    return 0;
+}
+
+
+
+
 static void process_key(char keychar)
 {
     // Debug inmediato al UART
@@ -565,13 +659,40 @@ static void process_key(char keychar)
 
     last_key_char = keychar; // se verá en "Key:X"
 
-    // Si ya estamos en lockout, solo mostramos eso y no aceptamos más teclas
-    if (lockout_active) {
-        lcd_show_status("Bloqueado", last_key_char);
+    // ====== 1) Clave maestra para quitar bloqueo (ABCD) ======
+    if (lockout_active || lock_state == LOCK_STATE_BLOCKED)
+    {
+        if (check_override_sequence(keychar))
+        {
+            // --- CANCELAR BLOQUEO ---
+            lockout_active        = 0;
+            lockout_seconds_left  = 0;
+            display_ss            = 0;
+            lock_attempts         = 0;
+
+            // Apagamos cualquier alarma / patrón de buzzer
+            alarm_ms_left = 0;
+            buzz_mode     = 0;
+            BUZZER_OFF();
+
+            // Si estaba en estado bloqueado, volver a "cerrado"
+            if (lock_state == LOCK_STATE_BLOCKED)
+            {
+                lock_state = LOCK_STATE_CLOSED;
+                lock_update_leds();
+            }
+
+            lcd_show_status("Desbloqueado", last_key_char);
+            USART2_puts("Override ABCD: bloqueo cancelado");
+        }
+        else
+        {
+            lcd_show_status("Bloqueado", last_key_char);
+        }
         return;
     }
 
-    // Tecla '#' = cerrar caja si está abierta
+    // ====== 2) Tecla '#' = cerrar caja si está abierta ======
     if (keychar == '#')
     {
         if (lock_state == LOCK_STATE_OPEN)
@@ -593,40 +714,253 @@ static void process_key(char keychar)
         return;
     }
 
-    // ========= ESTABA CERRADA → estamos ingresando PIN =========
+    // ========= ESTABA CERRADA → PIN, cambio PIN, ajuste de hora =========
     if (lock_state == LOCK_STATE_CLOSED)
     {
-        if (keychar >= '0' && keychar <= '9')
+        // --- 2.1) Tecla 'D' = entrar/salir de ajuste de hora ---
+        if (keychar == 'D')
         {
-            // voy acumulando los dígitos en lock_entered_code[]
-            if (lock_entered_len < LOCK_CODE_LEN) {
-                lock_entered_code[lock_entered_len++] = keychar;
+            // No permitir ajuste de hora si estamos cambiando PIN
+            if (pin_mode != PIN_MODE_NORMAL)
+            {
+                lcd_show_status("Fin Cambio PIN", last_key_char);
+                USART2_puts("No se puede ajustar hora mientras cambia PIN");
+                return;
             }
 
-            // ¿ya metió los 4 dígitos del PIN?
-            if (lock_entered_len >= LOCK_CODE_LEN)
+            if (clock_set_mode == CLOCK_SET_NONE)
             {
-                uint8_t ok = 1u;
-                for (uint8_t i = 0; i < LOCK_CODE_LEN; i++) {
-                    if (lock_entered_code[i] != lock_correct_code[i]) {
-                        ok = 0u;
-                        break;
-                    }
+                clock_set_mode   = CLOCK_SET_HOURS;
+                clock_set_digits = 0;
+                clock_set_val    = 0;
+                clock_set_pos    = 0;
+                clock_set_buf[0] = clock_set_buf[1] = clock_set_buf[2] = clock_set_buf[3] = 0;
+                lcd_show_status("Set Hora", last_key_char);
+                USART2_puts("Ajuste hora: ingrese HH (0-23)");
+            }
+            else
+            {
+                // Cancelar ajuste de hora
+                clock_set_mode   = CLOCK_SET_NONE;
+                clock_set_digits = 0;
+                clock_set_val    = 0;
+                clock_set_pos    = 0;
+                lcd_show_status("Ingrese PIN", last_key_char);
+                USART2_puts("Ajuste de hora cancelado");
+            }
+            return;
+        }
+
+        // --- 2.2) Tecla '*' = entrar/salir de cambio de PIN ---
+        if (keychar == '*')
+        {
+            // No permitir cambio de PIN si estamos ajustando hora
+            if (clock_set_mode != CLOCK_SET_NONE)
+            {
+                lcd_show_status("Fin ajuste hora", last_key_char);
+                USART2_puts("Termine ajuste de hora antes de cambiar PIN");
+                return;
+            }
+
+            if (pin_mode == PIN_MODE_NORMAL)
+            {
+                pin_mode = PIN_MODE_CHANGE_OLD;
+                lock_entered_len = 0;
+                lcd_show_status("PIN actual", last_key_char);
+                USART2_puts("Modo cambio PIN: ingrese PIN actual");
+            }
+            else
+            {
+                // '*' nuevamente -> cancelar cambio de PIN
+                pin_mode = PIN_MODE_NORMAL;
+                lock_entered_len = 0;
+                lcd_show_status("Ingrese PIN", last_key_char);
+                USART2_puts("Cambio PIN cancelado");
+            }
+            return;
+        }
+
+        // --- 2.3) Si es dígito, según el modo activo ---
+        if (keychar >= '0' && keychar <= '9')
+        {
+            uint8_t i;
+            uint8_t d = (uint8_t)(keychar - '0');
+
+            // ----- MODO AJUSTE DE HORA: HORAS (HH) -----
+            if (clock_set_mode == CLOCK_SET_HOURS)
+            {
+                if (clock_set_digits < 2 && clock_set_pos < 4)
+                {
+                    clock_set_buf[clock_set_pos] = d;      // guarda primer dígito en pos 0, luego 1
+                    clock_set_pos++;
+                    clock_set_val = (uint8_t)(clock_set_val*10u + d);
+                    clock_set_digits++;
                 }
 
-                // reset del buffer para el próximo intento
-                lock_entered_len = 0;
-
-                if (ok)
+                if (clock_set_digits >= 2)
                 {
-                    // ***** PIN CORRECTO *****
-                    lock_attempts = 0;
+                    if (clock_set_val <= 23u)
+                    {
+                        clock_hours = clock_set_val;
 
-                    lock_state = LOCK_STATE_OPENING;
-                    lock_update_leds();
+                        // Pasar a ajuste de minutos -> ahora se llenarán pos 2 y 3
+                        clock_set_mode   = CLOCK_SET_MINUTES;
+                        clock_set_digits = 0;
+                        clock_set_val    = 0;
+                        lcd_show_status("Set Minutos", last_key_char);
+                        USART2_puts("Horas ajustadas, ingrese MM (0-59)");
+                    }
+                    else
+                    {
+                        // Hora inválida
+                        clock_set_mode   = CLOCK_SET_NONE;
+                        clock_set_digits = 0;
+                        clock_set_val    = 0;
+                        clock_set_pos    = 0;
+                        lcd_show_status("Hora invalida", last_key_char);
+                        USART2_puts("Hora invalida (0-23)");
+                    }
+                }
+                else
+                {
+                    lcd_show_status("Set Hora", last_key_char);
+                }
+                return;
+            }
 
-                    lock_target_steps = (int32_t)LOCK_OPEN_STEPS;
-                    lock_stepper_start();
+            // ----- MODO AJUSTE DE HORA: MINUTOS (MM) -----
+            if (clock_set_mode == CLOCK_SET_MINUTES)
+            {
+                if (clock_set_digits < 2 && clock_set_pos < 4)
+                {
+                    clock_set_buf[clock_set_pos] = d;      // guarda en pos 2 y 3
+                    clock_set_pos++;
+                    clock_set_val = (uint8_t)(clock_set_val*10u + d);
+                    clock_set_digits++;
+                }
+
+                if (clock_set_digits >= 2)
+                {
+                    if (clock_set_val <= 59u)
+                    {
+                        clock_minutes = clock_set_val;
+                        clock_seconds = 0;
+
+                        clock_set_mode   = CLOCK_SET_NONE;
+                        clock_set_digits = 0;
+                        clock_set_val    = 0;
+                        clock_set_pos    = 0;
+
+                        // bip-bip éxito (si no hay alarma activa)
+                        if (alarm_ms_left == 0)
+                        {
+                            buzz_mode = 1;
+                            buzz_timer_ms = 100;
+                            BUZZER_ON();
+                        }
+
+                        lcd_show_status("Hora ajustada", last_key_char);
+                        USART2_puts("Hora ajustada HH:MM");
+                    }
+                    else
+                    {
+                        clock_set_mode   = CLOCK_SET_NONE;
+                        clock_set_digits = 0;
+                        clock_set_val    = 0;
+                        clock_set_pos    = 0;
+                        lcd_show_status("Minuto invalido", last_key_char);
+                        USART2_puts("Minuto invalido (0-59)");
+                    }
+                }
+                else
+                {
+                    lcd_show_status("Set Minutos", last_key_char);
+                }
+                return;
+            }
+
+            // ----- MODO CAMBIO: verificar PIN actual -----
+            if (pin_mode == PIN_MODE_CHANGE_OLD)
+            {
+                if (lock_entered_len < LOCK_CODE_LEN) {
+                    lock_entered_code[lock_entered_len++] = keychar;
+                }
+
+                if (lock_entered_len >= LOCK_CODE_LEN)
+                {
+                    uint8_t ok = 1u;
+                    for (i = 0; i < LOCK_CODE_LEN; i++) {
+                        if (lock_entered_code[i] != lock_correct_code[i]) {
+                            ok = 0u;
+                            break;
+                        }
+                    }
+
+                    lock_entered_len = 0;
+
+                    if (ok)
+                    {
+                        // PIN actual correcto -> pedir nuevo PIN
+                        pin_mode = PIN_MODE_CHANGE_NEW;
+                        lcd_show_status("Nuevo PIN", last_key_char);
+                        USART2_puts("PIN actual correcto, ingrese nuevo PIN");
+                    }
+                    else
+                    {
+                        // contamos como intento fallido normal
+                        lock_attempts++;
+                        USART2_puts("PIN actual incorrecto");
+
+                        if (lock_attempts >= 3)
+                        {
+                            // >>>>> ENTRAMOS A BLOQUEO <<<<<
+                            lock_state = LOCK_STATE_BLOCKED;
+                            lock_update_leds();
+
+                            lockout_seconds_left = 15;
+                            display_ss            = lockout_seconds_left;
+                            lockout_active        = 1;
+
+                            // alarma 3s
+                            alarm_ms_left = 3000;
+                            BUZZER_ON();
+
+                            lcd_show_status("Bloqueado", last_key_char);
+                            USART2_puts("Bloqueado 15s");
+                            pin_mode = PIN_MODE_NORMAL;
+                        }
+                        else
+                        {
+                            lcd_show_status("Pin Incorrecto", last_key_char);
+                            // para volver a intentar cambio de PIN, presiona '*' de nuevo
+                            pin_mode = PIN_MODE_NORMAL;
+                        }
+                    }
+                }
+                else
+                {
+                    lcd_show_status("PIN actual", last_key_char);
+                }
+                return;
+            }
+
+            // ----- MODO CAMBIO: guardar nuevo PIN -----
+            if (pin_mode == PIN_MODE_CHANGE_NEW)
+            {
+                if (lock_entered_len < LOCK_CODE_LEN) {
+                    lock_entered_code[lock_entered_len++] = keychar;
+                }
+
+                if (lock_entered_len >= LOCK_CODE_LEN)
+                {
+                    // Copiar nuevo PIN a la variable global
+                    for (i = 0; i < LOCK_CODE_LEN; i++) {
+                        lock_correct_code[i] = lock_entered_code[i];
+                    }
+
+                    lock_entered_len = 0;
+                    pin_mode         = PIN_MODE_NORMAL;
+                    lock_attempts    = 0;
 
                     // bip-bip éxito (si no hay alarma activa)
                     if (alarm_ms_left == 0) {
@@ -635,51 +969,98 @@ static void process_key(char keychar)
                         BUZZER_ON();
                     }
 
-                    lcd_show_status("Abriendo...", last_key_char);
-                    USART2_puts("PIN correcto, abriendo");
+                    lcd_show_status("PIN cambiado", last_key_char);
+                    USART2_puts("Nuevo PIN guardado");
                 }
                 else
                 {
-                    // ***** PIN INCORRECTO *****
-                    lock_attempts++;
-                    USART2_puts("PIN incorrecto");
+                    lcd_show_status("Nuevo PIN", last_key_char);
+                }
+                return;
+            }
 
-                    if (lock_attempts >= 3)
+            // ----- MODO NORMAL: ingreso de PIN para abrir -----
+            if (pin_mode == PIN_MODE_NORMAL)
+            {
+                if (lock_entered_len < LOCK_CODE_LEN) {
+                    lock_entered_code[lock_entered_len++] = keychar;
+                }
+
+                if (lock_entered_len >= LOCK_CODE_LEN)
+                {
+                    uint8_t ok = 1u;
+                    for (i = 0; i < LOCK_CODE_LEN; i++) {
+                        if (lock_entered_code[i] != lock_correct_code[i]) {
+                            ok = 0u;
+                            break;
+                        }
+                    }
+
+                    // reset del buffer para el próximo intento
+                    lock_entered_len = 0;
+
+                    if (ok)
                     {
-                        // >>>>> ENTRAMOS A BLOQUEO <<<<<
-                        lock_state = LOCK_STATE_BLOCKED;
+                        // ***** PIN CORRECTO *****
+                        lock_attempts = 0;
+
+                        lock_state = LOCK_STATE_OPENING;
                         lock_update_leds();
 
-                        lockout_seconds_left = 15;      // 15 segundos de castigo
-                        display_ss            = lockout_seconds_left;
-                        lockout_active        = 1;
+                        lock_target_steps = (int32_t)LOCK_OPEN_STEPS;
+                        lock_stepper_start();
 
-                        // alarma 3s
-                        alarm_ms_left = 3000;
-                        BUZZER_ON();
+                        // bip-bip éxito (si no hay alarma activa)
+                        if (alarm_ms_left == 0) {
+                            buzz_mode = 1;
+                            buzz_timer_ms = 100;
+                            BUZZER_ON();
+                        }
 
-                        lcd_show_status("Bloqueado", last_key_char);
-                        USART2_puts("Bloqueado 15s");
+                        lcd_show_status("Abriendo...", last_key_char);
+                        USART2_puts("PIN correcto, abriendo");
                     }
                     else
                     {
-                        // todavía le quedan intentos
-                        lcd_show_status("Pin Incorrecto", last_key_char);
+                        // ***** PIN INCORRECTO *****
+                        lock_attempts++;
+                        USART2_puts("PIN incorrecto");
+
+                        if (lock_attempts >= 3)
+                        {
+                            // >>>>> ENTRAMOS A BLOQUEO <<<<<
+                            lock_state = LOCK_STATE_BLOCKED;
+                            lock_update_leds();
+
+                            lockout_seconds_left = 15;      // 15 segundos de castigo
+                            display_ss            = lockout_seconds_left;
+                            lockout_active        = 1;
+
+                            // alarma 3s
+                            alarm_ms_left = 3000;
+                            BUZZER_ON();
+
+                            lcd_show_status("Bloqueado", last_key_char);
+                            USART2_puts("Bloqueado 15s");
+                        }
+                        else
+                        {
+                            // todavía le quedan intentos
+                            lcd_show_status("Pin Incorrecto", last_key_char);
+                        }
                     }
                 }
+                else
+                {
+                    // todavía no son 4 dígitos
+                    lcd_show_status("Ingrese PIN", last_key_char);
+                }
+                return;
             }
-            else
-            {
-                // todavía no son 4 dígitos
-                lcd_show_status("Ingrese PIN", last_key_char);
-            }
-        }
-        else
-        {
-            // apretó A/B/C/D/* etc estando cerrado
-            lcd_show_status("Ingrese PIN", last_key_char);
         }
 
+        // cualquier otra tecla (A/B/C) estando cerrado:
+        lcd_show_status("Ingrese PIN", last_key_char);
         return;
     }
 
@@ -690,9 +1071,14 @@ static void process_key(char keychar)
         return;
     }
 
-    // ========= Si está abriendo / cerrando / bloqueada esperando =========
+    // ========= Si está abriendo / cerrando =========
     lcd_show_status("Espere", last_key_char);
 }
+
+
+
+
+
 
 /*** ------------------ SysTick_Handler ------------------ */
 /*
@@ -813,51 +1199,107 @@ void TIM22_IRQHandler(void)
     {
         TIM22->SR &= ~TIM_SR_UIF;
 
-        // Si NO estamos bloqueados, display apagado
-        if (!lockout_active)
+        // 1) Si hay BLOQUEO ACTIVO => se mantiene el contador (lógica original)
+        if (lockout_active)
         {
+            static uint8_t which = DIG_TENS_IDX; // alterna entre decenas y unidades
+
+            // Apagamos todos
             seg_digits_all_off();
+
+            uint8_t val;
+            uint8_t blank = 0;
+
+            if (which == DIG_TENS_IDX)
+            {
+                val = (display_ss / 10) % 10;
+                if (val == 0)
+                    blank = 1; // sin cero a la izquierda
+            }
+            else // unidades
+            {
+                val = display_ss % 10;
+            }
+
+            seg_write_pattern(blank ? 0x00 : seg_lut[val]);
+            seg_digit_on(which);
+
+            which = (which == DIG_TENS_IDX) ? DIG_UNITS_IDX : DIG_TENS_IDX;
             return;
         }
 
-        // Si SÍ estamos bloqueados, multiplex normal entre decenas y unidades
-        static uint8_t which = DIG_TENS_IDX; // alterna entre decenas y unidades
+        // 2) Si NO hay bloqueo => reloj / modo ajuste
+        static uint8_t which4 = 0; // 0..3 -> Hten, Hun, Mten, Mun
 
-        // 1) Apagamos todos antes de cambiar
+        // Apagamos todos antes de cambiar
         seg_digits_all_off();
 
-        // 2) Qué dígito mostrar ahora
-        uint8_t val;
-        uint8_t blank = 0;
+        uint8_t pattern = 0;
 
-        if (which == DIG_TENS_IDX)
+        // --- MODO AJUSTE DE HORA: mostrar dígitos escritos y "_" parpadeando ---
+        if (clock_set_mode != CLOCK_SET_NONE)
         {
-            // decenas = display_ss / 10
-            val = (display_ss / 10) % 10;
-
-            // no muestres "0" a la izquierda si el tiempo <10
-            if (val == 0)
-                blank = 1;
+            if (which4 < clock_set_pos)
+            {
+                // Este dígito ya fue ingresado -> mostrarlo
+                uint8_t d = clock_set_buf[which4];
+                if (d < 10u)
+                    pattern = seg_lut[d];
+                else
+                    pattern = 0x00;
+            }
+            else
+            {
+                // Este dígito aún no se ingresa -> mostrar "_" parpadeante
+                if (colon_blink)
+                    pattern = SEG_UNDERSCORE;  // solo la línea de abajo
+                else
+                    pattern = 0x00;            // apagado
+            }
         }
-        else // which == DIG_UNITS_IDX
-        {
-            // unidades = display_ss % 10
-            val = display_ss % 10;
-        }
-
-        // 3) Mandar segmentos al bus PB0..PB7
-        seg_write_pattern(blank ? 0x00 : seg_lut[val]);
-
-        // 4) Encender SOLO ese dígito físico bajándolo (LOW = ON)
-        seg_digit_on(which);
-
-        // 5) Siguiente vez mostramos el otro dígito
-        if (which == DIG_TENS_IDX)
-            which = DIG_UNITS_IDX;
         else
-            which = DIG_TENS_IDX;
+        {
+            // --- MODO NORMAL: mostrar HH:MM con ":" parpadeando ---
+            uint8_t val = 0;
+            uint8_t dp_on = 0;
+
+            switch (which4)
+            {
+            case 0: // decena de hora
+                val   = (uint8_t)(clock_hours / 10u);
+                dp_on = 0;
+                break;
+            case 1: // unidad de hora
+                val   = (uint8_t)(clock_hours % 10u);
+                dp_on = colon_blink ? 1u : 0u;   // DPON para la "mitad" izquierda del ":"
+                break;
+            case 2: // decena de minuto
+                val   = (uint8_t)(clock_minutes / 10u);
+                dp_on = colon_blink ? 1u : 0u;   // DPON para la "mitad" derecha del ":"
+                break;
+            default: // 3 -> unidad de minuto
+                val   = (uint8_t)(clock_minutes % 10u);
+                dp_on = 0;
+                break;
+            }
+
+            pattern = seg_lut[val];
+#if SEG_HAS_DP
+            if (dp_on)
+                pattern |= SEG_DP_MASK;
+#endif
+        }
+
+        // Enviar patrón y encender SOLO ese dígito
+        seg_write_pattern(pattern);
+        seg_digit_on(which4);
+
+        // Siguiente dígito
+        which4 = (uint8_t)((which4 + 1u) & 0x03u);
     }
 }
+
+
 
 /*** ------------------ TIM2_IRQHandler: 1 Hz lockout countdown ------------------ */
 void TIM2_IRQHandler(void)
@@ -866,6 +1308,7 @@ void TIM2_IRQHandler(void)
     {
         TIM2->SR &= ~TIM_SR_UIF;
 
+        // ——— 1) Contador de bloqueo (lógica existente) ———
         if (lockout_active)
         {
             if (lockout_seconds_left > 0)
@@ -878,7 +1321,7 @@ void TIM2_IRQHandler(void)
             {
                 lockout_active        = 0;
                 lock_attempts         = 0;
-                display_ss            = 0; // muestra "00"
+                display_ss            = 0; // "00"
 
                 if (lock_state == LOCK_STATE_BLOCKED){
                     lock_state = LOCK_STATE_CLOSED;
@@ -889,8 +1332,29 @@ void TIM2_IRQHandler(void)
                 USART2_puts("Bloqueo finalizado");
             }
         }
+
+        // ——— 2) Tick de reloj 24h (siempre corre, esté o no en bloqueo) ———
+        clock_seconds++;
+        if (clock_seconds >= 60)
+        {
+            clock_seconds = 0;
+            clock_minutes++;
+            if (clock_minutes >= 60)
+            {
+                clock_minutes = 0;
+                clock_hours++;
+                if (clock_hours >= 24)
+                    clock_hours = 0;
+            }
+        }
+
+        // Parpadeo del "dos puntos" (cada segundo)
+        colon_blink ^= 1u;
     }
 }
+
+
+
 
 /*** ------------------ main() ------------------ */
 int main(void)
